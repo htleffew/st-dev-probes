@@ -356,8 +356,82 @@ function mount() {
         el('div', { className: 'inline-drawer-toggle inline-drawer-header' }, el('b', { textContent: 'Dev Probes' }),
             el('div', { className: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' })),
         body);
-    body.append(...phoneProbes());
+    body.append(...phoneProbes(), ...routeProbes());
     host.append(drawer);
+}
+
+// Route probes (MB8): can this page reach d3:4b at /v1/systemone on the desktop, and can a Jev-slot judgment run with
+// no key in the page or in settings.json? No key value is read, printed or stored by either probe.
+function routeProbes() {
+    const OUT_STYLE = 'white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow:auto;font-size:12px;';
+    const box = () => {
+        const out = el('pre', { style: OUT_STYLE });
+        const log = line => { out.textContent += line + '\n'; };
+        const copy = el('button', { className: 'menu_button', textContent: 'Copy output' });
+        copy.onclick = () => navigator.clipboard?.writeText(out.textContent);
+        return { out, log, copy };
+    };
+    const headers = () => (SillyTavern.getContext().getRequestHeaders?.() || { 'Content-Type': 'application/json' });
+    const btn = (label, fn) => { const b = el('button', { className: 'menu_button', textContent: label }); b.onclick = fn; return b; };
+    const base = el('input', { type: 'text', value: 'http://100.97.15.107:11434', className: 'text_pole' });
+    const d3 = box(), jev = box();
+    const STATE = 'Record A (older): Hale lives in the mill.\nRecord B (newer): Hale moved to the keep.';
+    const QUESTIONS = { q: { type: 'choice', instructions: 'How do the two story records relate?', criteria: { duplicate: 'same thing', update: 'B replaces A', distinct: 'different things' } } };
+
+    const d3Probe = async () => {
+        d3.out.textContent = '';
+        d3.log('=== d3:4b reach (' + new Date().toISOString() + ') origin ' + location.origin + ' ===');
+        d3.log('Note: this loads d3:4b on the desktop, which unloads gemma4:12b until the next chat call.');
+        const url = base.value.replace(/\/+$/, '') + '/v1/systemone';
+        const body = JSON.stringify({ model: 'd3:4b', state: STATE, questions: QUESTIONS });
+        const attempt = async (label, target, init) => {
+            const t0 = performance.now();
+            try {
+                const res = await fetch(target, init);
+                const text = await res.text();
+                d3.log(label + ': HTTP ' + res.status + ' in ' + Math.round(performance.now() - t0) + ' ms; ' + text.slice(0, 200));
+            } catch (x) { d3.log(label + ': ' + (x?.name || 'error') + ' ' + String(x?.message || x) + ' after ' + Math.round(performance.now() - t0) + ' ms (a TypeError here means the browser blocked it, usually CORS)'); }
+        };
+        await attempt('Direct from the page', url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        await attempt('Through SillyTavern CORS proxy', '/proxy/' + url, { method: 'POST', headers: { ...headers(), 'Content-Type': 'application/json' }, body });
+        d3.log('PROBE DONE');
+    };
+
+    const jevProbe = async () => {
+        jev.out.textContent = '';
+        jev.log('=== Jev key handling (' + new Date().toISOString() + ') ===');
+        try {
+            const res = await fetch('/api/secrets/read', { method: 'POST', headers: headers(), body: '{}' });
+            const state = res.ok ? await res.json() : {};
+            const or = state.api_key_openrouter;
+            jev.log('OpenRouter key saved in SillyTavern secrets: ' + (Array.isArray(or) ? or.length > 0 : !!or) + ' (presence only)');
+        } catch (x) { jev.log('secrets read failed: ' + x.message); }
+        try {
+            const res = await fetch('/api/settings/get', { method: 'POST', headers: headers(), body: '{}' });
+            const text = await res.text();
+            jev.log('settings.json holds an OpenRouter-shaped key: ' + /sk-or-v1-[A-Za-z0-9]{8}/.test(text) + '; any sk- key: ' + /\bsk-[A-Za-z0-9_-]{16}/.test(text));
+        } catch (x) { jev.log('settings read failed: ' + x.message); }
+        const svc = SillyTavern.getContext().ChatCompletionService;
+        if (typeof svc?.processRequest !== 'function') { jev.log('ChatCompletionService.processRequest: absent, so no host route'); jev.log('PROBE DONE'); return; }
+        const ask = async (model) => {
+            const t0 = performance.now();
+            try {
+                const json = await svc.processRequest({ stream: false, chat_completion_source: 'openrouter', model, max_tokens: 60,
+                    messages: [{ role: 'system', content: 'Answer with JSON on one line: {"attempt": true or false}.' }, { role: 'user', content: 'Player message: I try to climb the wall before the guards turn.' }] }, {}, false);
+                jev.log(model + ' through SillyTavern: ' + Math.round(performance.now() - t0) + ' ms; ' + String(json?.choices?.[0]?.message?.content || JSON.stringify(json?.error || json)).slice(0, 160));
+            } catch (x) { jev.log(model + ' through SillyTavern: ' + String(x?.message || x).slice(0, 200) + ' after ' + Math.round(performance.now() - t0) + ' ms'); }
+        };
+        await ask('typesafe/jev-router');
+        await ask('typesafe/jev-1.13');
+        jev.log('PROBE DONE');
+    };
+
+    return [
+        el('hr'), el('h3', { textContent: 'Route probes (MB8)' }),
+        el('div', { textContent: 'Each part prints its own output; press Copy output and send the text. No key is read, printed or stored.' }),
+        el('h4', { textContent: '1. d3:4b reach' }), el('div', {}, base), el('div', {}, btn('Start', d3Probe), d3.copy), d3.out,
+        el('h4', { textContent: '2. Jev key handling' }), el('div', {}, btn('Start', jevProbe), jev.copy), jev.out,
+    ];
 }
 
 // Phone probes (B16): five short checks of host behaviour on the phone (streaming, message menu, theme save, fixed surfaces, widths).

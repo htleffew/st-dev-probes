@@ -36,3 +36,10 @@ Five short checks of how the host behaves on the phone, at the bottom of the Dev
 3. **Theme save.** Press **Start**; no other taps. It saves a throwaway theme named `dev-probes-test` through the real Save button, checks the list and the server, deletes it, and selects your theme again.
 4. **Fixed surfaces.** Press **Start**, tap the message box when told (keyboard opens), then close the keyboard when told. It places a bar, a bottom sheet and a popover (each also in a top-anchored form) and records their positions against `visualViewport` with the keyboard closed and open.
 5. **Widths.** Fold the phone and press **Measure folded**, unfold it and press **Measure unfolded**, then **Copy output**. It records `innerWidth`, `visualViewport`, `devicePixelRatio` and screen size.
+
+### Route probes (MB8)
+
+Two checks that settle routes for background judgment calls. Neither reads, prints or stores a key value.
+
+1. **d3:4b reach.** Check the desktop address, press **Start**, then **Copy output**. It posts one small question to `d3:4b` at `/v1/systemone` straight from the page and again through SillyTavern's CORS proxy, and prints the status of each or the browser's error. It loads `d3:4b` on the desktop, which unloads `gemma4:12b` until the next chat call.
+2. **Jev key handling.** Press **Start**, then **Copy output**. It reports whether an OpenRouter key is saved in SillyTavern's secrets (presence only), whether `settings.json` holds anything shaped like a key (true or false only), and the answer and time of one judgment through SillyTavern's own OpenRouter connection for `typesafe/jev-router` and for `typesafe/jev-1.13`. The key stays on SillyTavern's side for both.
