@@ -1,0 +1,11 @@
+{
+    "display_name": "Dev Probes",
+    "loading_order": 99,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "Dr. H",
+    "version": "0.1.0",
+    "auto_update": false
+}
