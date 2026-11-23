@@ -320,9 +320,14 @@ function mount() {
         try { await navigator.clipboard.writeText(smallOut.textContent); toastr?.success?.('Probe output copied'); }
         catch { const r = document.createRange(); r.selectNodeContents(smallOut); getSelection().removeAllRanges(); getSelection().addRange(r); }
     };
+    let smallBusy = false; // one run at a time; overlapping runs interleave their output
     const smallRun = async () => {
-        smallOut.textContent = 'ENVIRONMENT ' + location.origin + ' ' + navigator.userAgent + ' secure=' + window.isSecureContext;
-        await runSmall(small.value, smallLog, force.checked);
+        if (smallBusy) { toastr?.info?.('A run is still going; wait for RUN DONE or FAILED'); return; }
+        smallBusy = true;
+        try {
+            smallOut.textContent = 'ENVIRONMENT ' + location.origin + ' ' + navigator.userAgent + ' secure=' + window.isSecureContext;
+            await runSmall(small.value, smallLog, force.checked);
+        } finally { smallBusy = false; }
     };
 
     const body = el('div', { className: 'inline-drawer-content' },
