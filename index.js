@@ -637,7 +637,7 @@ function phoneProbes() {
         const made = [];
         const box = (id, css, text) => {
             const n = el('div', { id, textContent: text });
-            n.style.cssText = 'position:fixed;z-index:99999;box-sizing:border-box;padding:6px 10px;font:13px sans-serif;color:#000;border:2px solid #000;pointer-events:none;overflow:hidden;' + css;
+            n.style.cssText = 'position:fixed;z-index:99999;box-sizing:border-box;padding:6px 10px;font:13px sans-serif;color:#000;border:2px solid #000;pointer-events:none;overflow:hidden;opacity:0.55;' + css;
             document.body.append(n); made.push(n); return n;
         };
         const bar = box('devprobe_bar', 'background:#ffd24d;left:8px;right:8px;height:34px;', 'BAR A: fixed, bottom-anchored');
@@ -689,7 +689,12 @@ function phoneProbes() {
             await sleep(300);
             snap('keyboard closed, first reading');
             s.log('');
-            s.log('STEP 1. Tap the message box now so the keyboard opens. (Waiting up to 60 s.)');
+            s.log('STEP 1. Tap the red "Open keyboard" button at the top of the screen. (Waiting up to 60 s.)');
+            // ponytail: the test sheets sit over the message box, so a top button focuses it inside the tap gesture
+            const kbBtn = el('button', { textContent: 'Open keyboard' });
+            kbBtn.style.cssText = 'position:fixed;z-index:100000;top:8px;left:50%;transform:translateX(-50%);padding:12px 20px;font:16px sans-serif;background:#e11d48;color:#fff;border:0;border-radius:8px;';
+            kbBtn.onclick = () => { ta.focus(); kbBtn.remove(); };
+            document.body.append(kbBtn); made.push(kbBtn);
             let focusAt = null;
             const opened = await poll(() => {
                 if (document.activeElement === ta && focusAt === null) focusAt = performance.now();
