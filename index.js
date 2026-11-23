@@ -356,7 +356,399 @@ function mount() {
         el('div', { className: 'inline-drawer-toggle inline-drawer-header' }, el('b', { textContent: 'Dev Probes' }),
             el('div', { className: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' })),
         body);
+    body.append(...phoneProbes());
     host.append(drawer);
+}
+
+// Phone probes (B16): five short checks of host behaviour on the phone (streaming, message menu, theme save, fixed surfaces, widths).
+// Each probe restores what it touches (try/finally), never sends a message, and makes no network call beyond SillyTavern's own theme and settings routes.
+function phoneProbes() {
+    const OUT_STYLE = 'white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow:auto;font-size:12px;';
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const r1 = n => (Math.round(n * 10) / 10);
+    const ctx = () => (window.SillyTavern && SillyTavern.getContext ? SillyTavern.getContext() : {});
+    let busy = null; // name of the running probe; only one runs at a time
+    const run = { abort: false };
+
+    const section = (title, blurb) => {
+        const out = el('pre', { textContent: blurb });
+        out.style.cssText = OUT_STYLE;
+        const s = { title, out, blurb };
+        s.log = line => { out.textContent += '\n' + line; out.scrollTop = out.scrollHeight; };
+        s.reset = text => { out.textContent = text; };
+        s.copy = el('button', { className: 'menu_button', textContent: 'Copy output' });
+        s.copy.onclick = async () => {
+            try { await navigator.clipboard.writeText(out.textContent); toastr?.success?.('Probe output copied'); }
+            catch { const r = document.createRange(); r.selectNodeContents(out); getSelection().removeAllRanges(); getSelection().addRange(r); }
+        };
+        s.stop = el('button', { className: 'menu_button', textContent: 'Stop' });
+        s.stop.onclick = () => { if (busy === title) { run.abort = true; } };
+        // Wraps a probe so only one runs at a time and every failure is written to the output.
+        s.guard = fn => async () => {
+            if (busy) { toastr?.info?.('"' + busy + '" is still running. Wait for it to finish or press its Stop button.'); return; }
+            busy = title; run.abort = false;
+            try { await fn(s); } catch (x) { s.log('FAILED: ' + (x && x.message ? x.message : x)); }
+            finally { busy = null; }
+        };
+        return s;
+    };
+    // Polls until cond() is true, the time runs out, or Stop is pressed.
+    const poll = async (cond, ms, step = 120) => {
+        const end = performance.now() + ms;
+        while (performance.now() < end && !run.abort) { if (cond()) return true; await sleep(step); }
+        return !run.abort && cond();
+    };
+    const head = (s, name) => {
+        s.reset(name + '\nwhen: ' + new Date().toISOString() + '\nbuild: ' + navigator.userAgent);
+    };
+
+    // ---------- 1. Streaming ----------
+    const sStream = section('Streaming', 'Streaming probe. Press Start, then follow the numbered steps it prints. Run it once with Streaming turned on and once with it turned off (AI Response Configuration).');
+    const EV_NAMES = ['GENERATION_STARTED', 'STREAM_TOKEN_RECEIVED', 'MESSAGE_UPDATED', 'MESSAGE_RECEIVED', 'CHARACTER_MESSAGE_RENDERED', 'MESSAGE_SENT', 'USER_MESSAGE_RENDERED', 'GENERATION_ENDED', 'GENERATION_STOPPED'];
+    const describe = a => (typeof a === 'string' ? 'text of ' + a.length + ' chars' : typeof a === 'number' ? 'number ' + a : typeof a);
+    const streamProbe = async s => {
+        head(s, 'STREAMING PROBE (B16-1)');
+        const c = ctx(), es = c.eventSource, ET = c.eventTypes;
+        if (!es || !ET) { s.log('FAILED: SillyTavern context has no eventSource or eventTypes.'); return; }
+        const chk = id => { const e = document.getElementById(id); return e ? String(e.checked) : 'not in this build'; };
+        s.log('main API: ' + c.mainApi);
+        s.log('streaming setting, chat completion (stream_toggle): ' + chk('stream_toggle'));
+        s.log('streaming setting, text completion (streaming_textgenerationwebui): ' + chk('streaming_textgenerationwebui'));
+        s.log('streaming setting, kobold (streaming_kobold): ' + chk('streaming_kobold'));
+        s.log('streaming setting, novel (streaming_novel): ' + chk('streaming_novel'));
+        s.log('smooth streaming (smooth_streaming): ' + chk('smooth_streaming'));
+        const active = { openai: 'stream_toggle', textgenerationwebui: 'streaming_textgenerationwebui', kobold: 'streaming_kobold', koboldhorde: 'streaming_kobold', novel: 'streaming_novel' }[c.mainApi];
+        s.log('STREAMING FOR THE ACTIVE API: ' + (active ? (chk(active) === 'true' ? 'ON' : chk(active) === 'false' ? 'OFF' : chk(active)) : 'unknown for ' + c.mainApi));
+        s.log('');
+        s.log('STEP 1. Now send a message in the chat (any text) and let the reply finish.');
+        s.log('The probe listens for up to 3 minutes and stops by itself 2.5 s after the reply ends. Press Stop to end it early.');
+        const t0 = performance.now(), now = () => Math.round(performance.now() - t0);
+        const stats = {}, handlers = [];
+        let generating = false, updatedDuring = 0, endTimer = null, ended = false;
+        for (const n of EV_NAMES) {
+            const ev = ET[n];
+            if (!ev) { s.log('event not defined in this build: ' + n); continue; }
+            stats[n] = { count: 0, first: null, last: null, samples: [] };
+            const h = (...a) => {
+                const st = stats[n], t = now();
+                st.count++; if (st.first === null) st.first = t; st.last = t;
+                if (st.samples.length < 8) st.samples.push(t + ' ms ' + describe(a[0]));
+                if (n === 'GENERATION_STARTED') generating = true;
+                if (n === 'MESSAGE_UPDATED' && generating) updatedDuring++;
+                if (n === 'GENERATION_ENDED' || n === 'GENERATION_STOPPED') {
+                    generating = false; clearTimeout(endTimer); endTimer = setTimeout(() => { ended = true; }, 2500);
+                }
+            };
+            es.on(ev, h); handlers.push([ev, h]);
+        }
+        const chat = document.getElementById('chat');
+        const lastText = () => document.querySelector('#chat .mes:last-child .mes_text');
+        let lastLen = lastText() ? lastText().textContent.length : -1;
+        const steps = [];
+        const mo = new MutationObserver(() => {
+            const m = lastText(); if (!m) return;
+            const l = m.textContent.length;
+            if (l !== lastLen) { lastLen = l; steps.push([now(), l]); }
+        });
+        if (chat) mo.observe(chat, { subtree: true, childList: true, characterData: true });
+        try {
+            await poll(() => ended, 180000);
+        } finally {
+            mo.disconnect();
+            for (const [ev, h] of handlers) es.removeListener(ev, h);
+            clearTimeout(endTimer);
+        }
+        s.log('');
+        s.log('RESULT (' + now() + ' ms listened)');
+        for (const n of EV_NAMES) {
+            const st = stats[n]; if (!st) continue;
+            s.log(n + ': ' + st.count + ' times' + (st.count ? ', first ' + st.first + ' ms, last ' + st.last + ' ms' : ''));
+            if (st.count && (n === 'STREAM_TOKEN_RECEIVED' || n === 'MESSAGE_UPDATED')) s.log('   first payloads: ' + st.samples.join('; '));
+        }
+        s.log('MESSAGE_UPDATED events while a reply was generating: ' + updatedDuring);
+        s.log('visible text growth steps in the last message: ' + steps.length + (steps.length ? ' (first ' + steps.slice(0, 6).map(x => x[0] + ' ms=' + x[1] + ' chars').join('; ') + ')' : ''));
+        const tok = stats.STREAM_TOKEN_RECEIVED ? stats.STREAM_TOKEN_RECEIVED.count : 0;
+        const started = stats.GENERATION_STARTED && stats.GENERATION_STARTED.count > 0;
+        if (!started) s.log('VERDICT: no reply was generated while listening. Press Start again, then send a message.');
+        else if (tok > 1) s.log('VERDICT: YES. The extension received streamed reply text (' + tok + ' STREAM_TOKEN_RECEIVED events).');
+        else if (tok === 1) s.log('VERDICT: ONE event only; the reply may have been too short to show streaming. Repeat with a longer reply.');
+        else s.log('VERDICT: NO streamed text reached the extension (0 STREAM_TOKEN_RECEIVED events). Streaming setting was ' + (active ? chk(active) : 'unknown') + (active && chk(active) === 'false' ? ' (expected: the reply arrives whole when streaming is off).' : ' (streaming is on, so this means the host does not pass streamed text to extensions).'));
+        s.log('STREAM DONE');
+    };
+
+    // ---------- 2. Message menu ----------
+    const sMenu = section('Message menu', 'Message menu probe. Open a chat that has at least one reply, press Start, then follow the numbered steps.');
+    const menuProbe = async s => {
+        head(s, 'MESSAGE MENU PROBE (B16-2)');
+        const all = [...document.querySelectorAll('#chat .mes')];
+        const replies = all.filter(m => m.getAttribute('is_user') !== 'true' && m.getAttribute('is_system') !== 'true');
+        s.log('messages in chat: ' + all.length + ', replies: ' + replies.length);
+        s.log('replies with a menu (...) button: ' + replies.filter(m => m.querySelector('.extraMesButtonsHint')).length);
+        s.log('Expand Message Actions setting (menu always open): ' + document.body.classList.contains('expandMessageActions'));
+        if (!replies.length) { s.log('No reply in this chat. Open a chat that has a reply and press Start again.'); return; }
+        const added = [];
+        const mk = () => el('div', { className: 'mes_button dev_probe_test fa-solid fa-flask', title: 'Dev Probes test entry' });
+        const addAll = () => document.querySelectorAll('#chat .mes .extraMesButtons, #message_template .extraMesButtons').forEach(c => {
+            if (!c.querySelector(':scope > .dev_probe_test')) { const n = mk(); c.append(n); added.push(n); }
+        });
+        const seen = { hintTouch: 0, hintOpen: null, entryPointer: 0, entryTouch: 0, entryClick: 0 };
+        let tapped = false;
+        const listeners = [];
+        const on = (type, fn) => { document.addEventListener(type, fn, true); listeners.push([type, fn]); };
+        const T0 = performance.now(), now = () => Math.round(performance.now() - T0);
+        for (const type of ['pointerdown', 'touchstart', 'click']) {
+            on(type, e => {
+                const hint = e.target.closest && e.target.closest('.extraMesButtonsHint');
+                const entry = e.target.closest && e.target.closest('.dev_probe_test');
+                if (hint) {
+                    s.log(now() + ' ms: the menu (...) button received ' + type + (e.pointerType ? ' (' + e.pointerType + ')' : ''));
+                    if (type === 'click') {
+                        seen.hintTouch++;
+                        setTimeout(() => {
+                            const box = hint.parentElement.querySelector('.extraMesButtons');
+                            const cs = box ? getComputedStyle(box) : null;
+                            const open = !!box && cs.display !== 'none' && cs.visibility !== 'hidden' && box.getBoundingClientRect().width > 0;
+                            seen.hintOpen = open;
+                            s.log('menu is open 700 ms after the tap: ' + (open ? 'YES' : 'NO'));
+                            if (open) {
+                                const vis = [...box.children].filter(b => getComputedStyle(b).display !== 'none');
+                                s.log('menu entries shown: ' + vis.length + ' (' + vis.map(b => (b.title || b.className.split(' ').find(k => k.startsWith('mes_')) || '?') + ' ' + r1(b.getBoundingClientRect().width) + 'x' + r1(b.getBoundingClientRect().height)).join(', ') + ')');
+                                const br = box.getBoundingClientRect();
+                                s.log('menu box: left ' + r1(br.left) + ', right ' + r1(br.right) + ', window width ' + innerWidth + (br.right > innerWidth + 1 || br.left < -1 ? ' (EXTENDS PAST THE SCREEN)' : ' (inside the screen)'));
+                            }
+                        }, 700);
+                    }
+                }
+                if (entry) {
+                    if (type === 'pointerdown') seen.entryPointer++;
+                    if (type === 'touchstart') seen.entryTouch++;
+                    if (type === 'click') { seen.entryClick++; tapped = true; }
+                    s.log(now() + ' ms: TEST ENTRY (flask icon) received ' + type + (e.pointerType ? ' (' + e.pointerType + ')' : ''));
+                }
+            });
+        }
+        const mo = new MutationObserver(addAll);
+        const chat = document.getElementById('chat');
+        try {
+            addAll();
+            if (chat) mo.observe(chat, { childList: true, subtree: true });
+            s.log('test entry (flask icon) added to ' + added.length + ' menus.');
+            s.log('');
+            s.log('STEP 1. On any reply, tap the three dots (...) at the top right of the message to open its menu.');
+            s.log('STEP 2. In the opened menu, find the flask icon (the last icon in the menu) and tap it once.');
+            s.log('The probe listens for 2 minutes, finishes by itself after you tap the flask, and removes the entry. Press Stop to end early.');
+            await poll(() => tapped, 120000);
+            if (tapped) await sleep(900);
+        } finally {
+            mo.disconnect();
+            for (const [t, f] of listeners) document.removeEventListener(t, f, true);
+            document.querySelectorAll('.dev_probe_test').forEach(n => n.remove());
+            if (seen.hintOpen && !document.body.classList.contains('expandMessageActions')) document.body.click();
+        }
+        s.log('');
+        s.log('RESULT');
+        s.log('menu (...) taps received: ' + seen.hintTouch + '; menu opened: ' + (seen.hintOpen === null ? 'not tapped' : seen.hintOpen ? 'YES' : 'NO'));
+        s.log('test entry events: pointerdown ' + seen.entryPointer + ', touchstart ' + seen.entryTouch + ', click ' + seen.entryClick);
+        s.log('test entries left in the page: ' + document.querySelectorAll('.dev_probe_test').length + ' (should be 0)');
+        s.log('VERDICT: ' + (tapped ? 'YES. The menu ' + (seen.hintOpen === false ? '(did not report open, but the entry was reachable) ' : 'opened by touch and ') + 'accepted an extension entry that received the tap.' : 'NO tap reached the test entry (menu opened: ' + (seen.hintOpen === null ? 'no tap seen on the ... button' : seen.hintOpen) + ').'));
+        s.log('MENU DONE');
+    };
+
+    // ---------- 3. Theme save ----------
+    const sTheme = section('Theme save', 'Theme save probe. Press Start; no other taps. It saves a throwaway theme called dev-probes-test, checks it, deletes it, and puts your theme back.');
+    const themeProbe = async s => {
+        head(s, 'THEME SAVE PROBE (B16-3)');
+        const NAME = 'dev-probes-test';
+        const sel = document.getElementById('themes');
+        const saveBtn = document.getElementById('ui-preset-save-button'), delBtn = document.getElementById('ui-preset-delete-button');
+        if (!sel || !saveBtn || !delBtn) { s.log('FAILED: theme controls not found in this build.'); return; }
+        const names = () => [...sel.options].map(o => o.value);
+        const orig = sel.value;
+        s.log('selected theme before: ' + JSON.stringify(orig) + ' of ' + names().length + ' themes');
+        if (names().includes(NAME)) { s.log('A theme named ' + NAME + ' already exists; not touching it. Delete it by hand and run again.'); return; }
+        const api = {};
+        const realFetch = window.fetch;
+        window.fetch = async function (input, init) {
+            const res = await realFetch.apply(this, arguments);
+            try {
+                const u = typeof input === 'string' ? input : input.url;
+                if (/\/api\/themes\/(save|delete)/.test(u)) api[u.split('/').pop()] = res.status;
+            } catch { /* ignore */ }
+            return res;
+        };
+        const serverNames = async () => {
+            const res = await realFetch('/api/settings/get', { method: 'POST', headers: ctx().getRequestHeaders ? ctx().getRequestHeaders() : { 'Content-Type': 'application/json' }, body: '{}' });
+            if (!res.ok) throw new Error('settings/get returned ' + res.status);
+            return (await res.json()).themes.map(t => t.name);
+        };
+        const popupDo = async (fill) => {
+            const ok = await poll(() => document.querySelector('dialog.popup[open] .popup-button-ok'), 6000, 80);
+            if (!ok) throw new Error('the popup did not appear');
+            const dlg = document.querySelector('dialog.popup[open]');
+            if (fill) { const i = dlg.querySelector('.popup-input'); i.value = NAME; i.dispatchEvent(new Event('input', { bubbles: true })); }
+            dlg.querySelector('.popup-button-ok').click();
+        };
+        let ok = false;
+        try {
+            s.log('STEP 1 (automatic): pressing the real Save theme button and naming it ' + NAME);
+            saveBtn.click();
+            await popupDo(true);
+            const appeared = await poll(() => names().includes(NAME), 6000);
+            s.log('theme appears in the theme list: ' + (appeared ? 'YES' : 'NO'));
+            s.log('save request HTTP status: ' + (api.save ?? 'none seen'));
+            await sleep(300);
+            const onServer = await serverNames();
+            s.log('server settings list the new theme: ' + (onServer.includes(NAME) ? 'YES' : 'NO'));
+            ok = appeared && onServer.includes(NAME) && api.save === 200;
+        } finally {
+            s.log('STEP 2 (automatic): deleting the test theme');
+            try {
+                if (names().includes(NAME)) {
+                    if (sel.value !== NAME) { sel.value = NAME; sel.dispatchEvent(new Event('change', { bubbles: true })); await sleep(200); }
+                    delBtn.click();
+                    await popupDo(false);
+                    await poll(() => !names().includes(NAME), 6000);
+                }
+                if ((await serverNames()).includes(NAME)) {
+                    s.log('the UI delete left the theme on the server; deleting it directly');
+                    await realFetch('/api/themes/delete', { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ name: NAME }) });
+                }
+            } catch (x) { s.log('delete step problem: ' + (x && x.message ? x.message : x)); }
+            window.fetch = realFetch;
+            if (sel.value !== orig && names().includes(orig)) { sel.value = orig; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+            await sleep(400);
+            let left = '?';
+            try { left = (await serverNames()).includes(NAME) ? 'YES (delete by hand)' : 'no'; } catch { /* ignore */ }
+            s.log('delete request HTTP status: ' + (api.delete ?? 'none seen'));
+            s.log('test theme still in the list: ' + (names().includes(NAME) ? 'YES (delete by hand)' : 'no') + '; still on the server: ' + left);
+            s.log('selected theme after: ' + JSON.stringify(sel.value) + (sel.value === orig ? ' (restored, same as before)' : ' (DIFFERENT from before; choose ' + JSON.stringify(orig) + ' by hand)'));
+        }
+        s.log('VERDICT: ' + (ok ? 'YES. Theme save wrote a new theme on this build.' : 'NO or partial. See the lines above.'));
+        s.log('THEME DONE');
+    };
+
+    // ---------- 4. Fixed and bottom-anchored surfaces ----------
+    const sSurf = section('Fixed surfaces', 'Fixed surfaces probe. Press Start, then follow the numbered steps it prints.');
+    const surfProbe = async s => {
+        head(s, 'FIXED SURFACES PROBE (B16-4)');
+        const sf = document.getElementById('send_form'), ta = document.getElementById('send_textarea');
+        if (!sf || !ta) { s.log('FAILED: message box not found.'); return; }
+        const vv = window.visualViewport;
+        const made = [];
+        const box = (id, css, text) => {
+            const n = el('div', { id, textContent: text });
+            n.style.cssText = 'position:fixed;z-index:99999;box-sizing:border-box;padding:6px 10px;font:13px sans-serif;color:#000;border:2px solid #000;pointer-events:none;overflow:hidden;' + css;
+            document.body.append(n); made.push(n); return n;
+        };
+        const bar = box('devprobe_bar', 'background:#ffd24d;left:8px;right:8px;height:34px;', 'BAR A: fixed, bottom-anchored');
+        const bar2 = box('devprobe_bar2', 'background:#ffa94d;left:8px;right:8px;height:34px;', 'BAR B: fixed, top-anchored');
+        const sheet = box('devprobe_sheet', 'background:#7fd1ff;left:0;right:0;bottom:0;height:150px;border-radius:12px 12px 0 0;', 'SHEET A: fixed, bottom 0');
+        const sheet2 = box('devprobe_sheet2', 'background:#a5b4fc;left:0;right:0;height:150px;border-radius:12px 12px 0 0;', 'SHEET B: fixed, top-anchored');
+        const pop = box('devprobe_pop', 'background:#b6f5a8;width:180px;height:90px;border-radius:10px;', 'POPOVER: fixed, top-anchored above the send button');
+        const anchored = () => {
+            const r = sf.getBoundingClientRect();
+            const v = box4();
+            bar.style.bottom = Math.max(0, innerHeight - r.top) + 'px';
+            bar2.style.top = Math.max(0, r.top - 38) + 'px';
+            sheet2.style.top = Math.max(0, v.B - 150) + 'px';
+            const a = (document.getElementById('send_but') && document.getElementById('send_but').offsetParent ? document.getElementById('send_but') : ta).getBoundingClientRect();
+            pop.style.left = Math.max(4, Math.min(innerWidth - 184, a.right - 180)) + 'px';
+            pop.style.top = Math.max(0, r.top - 38 - 98) + 'px';
+        };
+        const box4 = () => vv ? { L: vv.offsetLeft, T: vv.offsetTop, R: vv.offsetLeft + vv.width, B: vv.offsetTop + vv.height } : { L: 0, T: 0, R: innerWidth, B: innerHeight };
+        const verdict = r => {
+            const v = box4();
+            const inside = r.left >= v.L - 1 && r.right <= v.R + 1 && r.top >= v.T - 1 && r.bottom <= v.B + 1;
+            const overlap = r.right > v.L && r.left < v.R && r.bottom > v.T && r.top < v.B;
+            return inside ? 'ON SCREEN' : overlap ? 'PARTLY OFF SCREEN (' + r1(Math.max(0, r.bottom - v.B)) + ' px below, ' + r1(Math.max(0, v.T - r.top)) + ' px above)' : 'OFF SCREEN';
+        };
+        const safe = () => {
+            const p = el('div'); p.style.cssText = 'position:fixed;visibility:hidden;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)';
+            document.body.append(p); const cs = getComputedStyle(p);
+            const v = [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].join(' '); p.remove(); return v;
+        };
+        const snap = label => {
+            s.log('');
+            s.log('[' + label + ']');
+            s.log('  window ' + innerWidth + 'x' + innerHeight + ', clientHeight ' + document.documentElement.clientHeight + ', scrollY ' + r1(scrollY));
+            s.log('  visualViewport ' + (vv ? r1(vv.width) + 'x' + r1(vv.height) + ' offset (' + r1(vv.offsetLeft) + ', ' + r1(vv.offsetTop) + ') scale ' + vv.scale : 'not available'));
+            s.log('  safe-area insets (top right bottom left): ' + safe() + '; virtualKeyboard API: ' + ('virtualKeyboard' in navigator ? 'yes' + (navigator.virtualKeyboard.boundingRect ? ' height ' + r1(navigator.virtualKeyboard.boundingRect.height) : '') : 'no'));
+            s.log('  focused element: ' + (document.activeElement ? document.activeElement.tagName + '#' + document.activeElement.id : 'none'));
+            for (const [name, n] of [['message box', sf], ['bar A (bottom-anchored)', bar], ['bar B (top-anchored)', bar2], ['sheet A (bottom 0)', sheet], ['sheet B (top-anchored)', sheet2], ['popover (top-anchored)', pop]]) {
+                const r = n.getBoundingClientRect();
+                s.log('  ' + name + ': top ' + r1(r.top) + ', bottom ' + r1(r.bottom) + ', left ' + r1(r.left) + ', right ' + r1(r.right) + ', ' + r1(r.width) + 'x' + r1(r.height) + ' -> ' + verdict(r));
+            }
+        };
+        const hs = getComputedStyle(document.documentElement), bs = getComputedStyle(document.body);
+        s.log('page frame: html transform ' + hs.transform + ', html height ' + hs.height + ', body position ' + bs.position + ', body height ' + bs.height);
+        s.log('(a transform on html makes it the anchor for fixed items, so a fixed item given bottom:0 sits at the bottom of html, not of the screen)');
+        const baseH = vv ? vv.height : innerHeight, baseI = innerHeight;
+        const kb = () => (baseH - (vv ? vv.height : innerHeight) > 100) || (baseI - innerHeight > 100);
+        try {
+            anchored();
+            await sleep(300);
+            snap('keyboard closed, first reading');
+            s.log('');
+            s.log('STEP 1. Tap the message box now so the keyboard opens. (Waiting up to 60 s.)');
+            let focusAt = null;
+            const opened = await poll(() => {
+                if (document.activeElement === ta && focusAt === null) focusAt = performance.now();
+                return kb() || (focusAt !== null && performance.now() - focusAt > 3000);
+            }, 60000);
+            if (!opened) { s.log('No keyboard seen within 60 s; skipping the keyboard-open readings.'); }
+            else {
+                const bySize = kb();
+                s.log('keyboard seen: ' + (bySize ? 'viewport shrank by ' + r1(baseH - (vv ? vv.height : innerHeight)) + ' px (visualViewport) and ' + (baseI - innerHeight) + ' px (window.innerHeight)' : 'the message box has focus but the viewport did not change (keyboard may overlay the page)'));
+                await sleep(700);
+                snap('keyboard open, surfaces as they were (not re-anchored)');
+                anchored();
+                await sleep(500);
+                snap('keyboard open, bar and popover re-anchored to the message box');
+                s.log('');
+                s.log('STEP 2. Close the keyboard now (back gesture, or tap outside the message box). (Waiting up to 40 s.)');
+                const closed = await poll(() => bySize ? !kb() : document.activeElement !== ta, 40000);
+                if (closed) { await sleep(700); anchored(); await sleep(300); snap('keyboard closed again'); }
+                else s.log('keyboard did not close within 40 s; no closing reading.');
+            }
+        } finally {
+            made.forEach(n => n.remove());
+        }
+        s.log('');
+        s.log('test surfaces left in the page: ' + document.querySelectorAll('#devprobe_bar, #devprobe_bar2, #devprobe_sheet, #devprobe_sheet2, #devprobe_pop').length + ' (should be 0)');
+        s.log('SURFACES DONE');
+    };
+
+    // ---------- 5. Widths ----------
+    const sWidth = section('Widths', 'Widths probe. Fold the phone (cover screen) and press "Measure folded", then unfold it and press "Measure unfolded", then press Copy output. Each press adds a block below.');
+    const widthProbe = label => s => {
+        const mm = q => { try { return matchMedia(q).matches; } catch { return 'unsupported'; } };
+        const vv = window.visualViewport;
+        s.log('');
+        s.log('=== ' + label.toUpperCase() + ' (' + new Date().toISOString() + ') ===');
+        s.log('window.innerWidth x innerHeight: ' + innerWidth + ' x ' + innerHeight + ' CSS px');
+        s.log('window.outerWidth x outerHeight: ' + outerWidth + ' x ' + outerHeight);
+        s.log('documentElement.clientWidth x clientHeight: ' + document.documentElement.clientWidth + ' x ' + document.documentElement.clientHeight);
+        s.log('visualViewport width x height (scale): ' + (vv ? r1(vv.width) + ' x ' + r1(vv.height) + ' (' + vv.scale + ')' : 'not available'));
+        s.log('devicePixelRatio: ' + devicePixelRatio + ' (device pixels wide: ' + Math.round(innerWidth * devicePixelRatio) + ')');
+        s.log('screen.width x height: ' + screen.width + ' x ' + screen.height + '; availWidth x availHeight: ' + screen.availWidth + ' x ' + screen.availHeight);
+        s.log('screen.orientation: ' + (screen.orientation ? screen.orientation.type + ' ' + screen.orientation.angle + ' deg' : 'n/a'));
+        s.log('max-width 1000px (SillyTavern mobile layout): ' + mm('(max-width: 1000px)') + '; max-width 600px: ' + mm('(max-width: 600px)') + '; pointer coarse: ' + mm('(pointer: coarse)') + '; hover none: ' + mm('(hover: none)'));
+        s.log('device-posture folded: ' + mm('(device-posture: folded)') + '; horizontal-viewport-segments 2: ' + mm('(horizontal-viewport-segments: 2)') + '; display-mode: ' + (['standalone', 'fullscreen', 'browser', 'minimal-ui'].find(m => mm('(display-mode: ' + m + ')') === true) || 'n/a'));
+    };
+
+    // ---------- layout ----------
+    const btn = (label, fn) => { const b = el('button', { className: 'menu_button', textContent: label }); b.onclick = fn; return b; };
+    const wBtn = (label, name) => btn(label, sWidth.guard(s => widthProbe(name)(s)));
+    const part = (heading, s, ...buttons) => [el('h4', { textContent: heading }), el('div', {}, ...buttons, s.copy), s.out];
+    return [
+        el('hr'), el('h3', { textContent: 'Phone probes (B16)' }),
+        el('div', { textContent: 'Run each part, then press its Copy output and send the text back. Nothing is sent anywhere, no message is sent for you, and every test item is removed when the probe ends.' }),
+        ...part('1. Streaming', sStream, btn('Start', sStream.guard(streamProbe)), sStream.stop),
+        ...part('2. Message menu', sMenu, btn('Start', sMenu.guard(menuProbe)), sMenu.stop),
+        ...part('3. Theme save', sTheme, btn('Start', sTheme.guard(themeProbe))),
+        ...part('4. Fixed surfaces', sSurf, btn('Start', sSurf.guard(surfProbe)), sSurf.stop),
+        ...part('5. Widths', sWidth, wBtn('Measure folded', 'folded (cover screen)'), wBtn('Measure unfolded', 'unfolded (inner screen)')),
+    ];
 }
 
 jQuery(() => mount());
