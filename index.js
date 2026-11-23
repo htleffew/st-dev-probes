@@ -40,7 +40,6 @@ const NEED_192 = 201326592; // buffer_size_required_bytes in WebLLM's gemma-4-E2
 const SMALL_MODELS = [
     ['webllm|SmolLM2-360M-Instruct-q4f16_1-MLC', 'WebLLM SmolLM2-360M-Instruct q4f16 (about 0.4 GB)'],
     ['tf|HuggingFaceTB/SmolLM2-360M-Instruct|q4f16', 'transformers.js SmolLM2-360M-Instruct q4f16 (273 MB)'],
-    ['tf|onnx-community/gemma-3-270m-it-ONNX|q4f16', 'transformers.js Gemma 3 270M it q4f16 (273 MB)'],
     ['webllm|Qwen3-0.6B-q4f16_1-MLC', 'WebLLM Qwen3-0.6B q4f16 (about 1.4 GB)'],
     ['tf|onnx-community/Qwen3-0.6B-ONNX|q4f16', 'transformers.js Qwen3-0.6B q4f16 (570 MB)'],
     ['litert|' + LITERT_FILE, 'LiteRT-LM.js Gemma 4 E2B web (2.0 GB)'],
@@ -330,13 +329,28 @@ function mount() {
         } finally { smallBusy = false; }
     };
 
+    // Deletes only the probe libraries' model stores; SillyTavern's own storage does not match these names.
+    const PROBE_STORE = /transformers|webllm|tvmjs|litert|onnx/i;
+    const clearModels = async () => {
+        const fmt = b => (b / 1e6).toFixed(0) + ' MB';
+        const before = (await navigator.storage?.estimate?.())?.usage ?? 0;
+        const cacheNames = ('caches' in self) ? (await caches.keys()).filter(n => PROBE_STORE.test(n)) : [];
+        const dbNames = indexedDB.databases ? (await indexedDB.databases()).map(d => d.name).filter(n => n && PROBE_STORE.test(n)) : [];
+        if (!cacheNames.length && !dbNames.length) { smallOut.textContent = 'No downloaded probe models found. Storage in use: ' + fmt(before); return; }
+        if (!confirm('Delete downloaded test models?\n' + [...cacheNames, ...dbNames].join('\n'))) return;
+        for (const n of cacheNames) await caches.delete(n);
+        for (const n of dbNames) await new Promise(r => { const q = indexedDB.deleteDatabase(n); q.onsuccess = q.onerror = q.onblocked = r; });
+        const after = (await navigator.storage?.estimate?.())?.usage ?? 0;
+        smallOut.textContent = 'Deleted: ' + [...cacheNames, ...dbNames].join(', ') + '\nStorage in use: ' + fmt(before) + ' before, ' + fmt(after) + ' after';
+    };
+
     const body = el('div', { className: 'inline-drawer-content' },
         el('h4', { textContent: 'Embedding speed (M1d)' }), el('div', {}, model, device),
         el('div', {}, btn('1. Check environment', env), btn('2. Run benchmark', run), btn('Copy output', copy)),
         out,
         el('hr'), el('h4', { textContent: 'Small model speed (M1j)' }), el('div', {}, small),
         el('label', {}, force, ' Try anyway when the adapter limit is too low (can download 3.4 GB and crash the tab)'),
-        el('div', {}, btn('Run model', smallRun), btn('Copy output', smallCopy)),
+        el('div', {}, btn('Run model', smallRun), btn('Copy output', smallCopy), btn('Delete downloaded models', clearModels)),
         smallOut);
     const drawer = el('div', { id: 'm1d_probe', className: 'inline-drawer' },
         el('div', { className: 'inline-drawer-toggle inline-drawer-header' }, el('b', { textContent: 'Dev Probes' }),
