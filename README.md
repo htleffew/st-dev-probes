@@ -43,3 +43,7 @@ Two checks that settle routes for background judgment calls. Neither reads, prin
 
 1. **d3:4b reach.** Check the desktop address, press **Start**, then **Copy output**. It posts one small question to `d3:4b` at `/v1/systemone` straight from the page and again through SillyTavern's CORS proxy, and prints the status of each or the browser's error. It loads `d3:4b` on the desktop, which unloads `gemma4:12b` until the next chat call.
 2. **Jev key handling.** Press **Start**, then **Copy output**. It reports whether an OpenRouter key is saved in SillyTavern's secrets (presence only), whether `settings.json` holds anything shaped like a key (true or false only), and the answer and time of one judgment through SillyTavern's own OpenRouter connection for `typesafe/jev-router` and for `typesafe/jev-1.13`. The key stays on SillyTavern's side for both.
+
+### Generation hook (MB6)
+
+Checks whether an extension's generate interceptor can leave chat messages out of the request this host sends. Open a chat with at least two messages after the greeting, press **Start**, then send any message. For that one request the probe takes the oldest message after the greeting out of the request's copy of the chat and puts a marker line in its place, then reads the final prompt. The output ends with a `RESULT:` line. Your chat and settings are not changed.

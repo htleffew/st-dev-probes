@@ -356,7 +356,7 @@ function mount() {
         el('div', { className: 'inline-drawer-toggle inline-drawer-header' }, el('b', { textContent: 'Dev Probes' }),
             el('div', { className: 'inline-drawer-icon fa-solid fa-circle-chevron-down down' })),
         body);
-    body.append(...phoneProbes(), ...routeProbes());
+    body.append(...phoneProbes(), ...routeProbes(), ...hookProbes());
     host.append(drawer);
 }
 
@@ -828,6 +828,60 @@ function phoneProbes() {
         ...part('4. Fixed surfaces', sSurf, btn('Start', sSurf.guard(surfProbe)), sSurf.stop),
         ...part('5. Widths', sWidth, wBtn('Measure folded', 'folded (cover screen)'), wBtn('Measure unfolded', 'unfolded (inner screen)')),
     ];
+}
+
+// Generation hook (MB6): can an extension's generate interceptor leave chat messages out of the request this host
+// sends, and put a message of its own at their place? Armed by Start, the interceptor acts on the next generation only:
+// it takes the oldest message after the greeting out of the request's copy of the chat and puts a narrator message in
+// its place. The final prompt (Chat Completion or Text Completion) is then read for both. The chat itself is never changed.
+const HOOK_MARK = 'DEV-PROBES-HOOK-MARK: this line stands in for a message the probe left out.';
+let hookArmed = null;
+globalThis.devProbesInterceptor = async (chat, contextSize, abort, type) => {
+    if (!hookArmed) return;
+    const probe = hookArmed;
+    probe.log('interceptor ran: type ' + (type || 'normal') + ', ' + chat.length + ' messages in the request copy, context ' + contextSize);
+    const at = chat.findIndex((m, i) => i > 0 && !m.is_system && String(m.mes || '').trim().length > 12);
+    if (at < 0 || chat.length < 3) { probe.log('FAILED: the chat needs at least two messages after the greeting'); hookArmed = null; return; }
+    probe.removed = String(chat[at].mes).trim().slice(0, 60);
+    probe.sameExtra = chat[at].extra === SillyTavern.getContext().chat.find(m => m.send_date === chat[at].send_date)?.extra;
+    chat.splice(at, 1, { name: '', is_user: false, is_system: false, send_date: '', mes: HOOK_MARK, extra: { type: 'narrator' } });
+    probe.log('left out: "' + probe.removed + '" and put the marker at position ' + at);
+};
+
+function hookProbes() {
+    const out = el('pre', { style: 'white-space:pre-wrap;word-break:break-word;max-height:50vh;overflow:auto;font-size:12px;' });
+    const log = line => { out.textContent += line + '\n'; };
+    const copy = el('button', { className: 'menu_button', textContent: 'Copy output' });
+    copy.onclick = () => navigator.clipboard?.writeText(out.textContent);
+    const c = () => SillyTavern.getContext();
+    const read = (where, text) => {
+        if (!hookArmed) return;
+        const probe = hookArmed;
+        hookArmed = null;
+        const marker = text.includes('DEV-PROBES-HOOK-MARK');
+        const gone = probe.removed ? !text.includes(probe.removed) : false;
+        log(where + ': marker in the prompt: ' + marker + '; left-out message absent: ' + gone);
+        log(marker && gone ? 'RESULT: the generation hook can leave messages out of the request on this host' : 'RESULT: the hook did not change the prompt here; stored hiding is the fallback');
+        log('chat unchanged: ' + !c().chat.some(m => String(m.mes).includes('DEV-PROBES-HOOK-MARK')));
+        log('PROBE DONE');
+    };
+    const ev = c().eventTypes || {};
+    if (ev.CHAT_COMPLETION_PROMPT_READY) c().eventSource.on(ev.CHAT_COMPLETION_PROMPT_READY, data => { if (!data?.dryRun) read('Chat Completion prompt', JSON.stringify(data?.chat || [])); });
+    if (ev.GENERATE_AFTER_COMBINE_PROMPTS) c().eventSource.on(ev.GENERATE_AFTER_COMBINE_PROMPTS, data => { if (!data?.dryRun && c().mainApi !== 'openai') read('Text Completion prompt', String(data?.prompt || '')); });
+    const start = () => {
+        out.textContent = '';
+        log('=== Generation hook (' + new Date().toISOString() + ') ===');
+        const manifests = Object.keys(globalThis).filter(k => /Interceptor$/.test(k) && typeof globalThis[k] === 'function');
+        log('interceptor functions on the page: ' + manifests.join(', '));
+        log('API: ' + (c().mainApi || '') + '; chat messages: ' + c().chat.length);
+        hookArmed = { log };
+        log('Armed. Send any message (or swipe the last reply) and wait for the reply to start.');
+    };
+    const b = el('button', { className: 'menu_button', textContent: 'Start' });
+    b.onclick = start;
+    return [el('hr'), el('h3', { textContent: 'Generation hook (MB6)' }),
+        el('div', { textContent: 'Open a chat with at least two messages after the greeting, press Start, then send any message. The probe leaves one old message out of that one request and checks the prompt the host builds. Your chat is not changed.' }),
+        el('div', {}, b, copy), out];
 }
 
 jQuery(() => mount());
